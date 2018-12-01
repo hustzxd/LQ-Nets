@@ -1,3 +1,8 @@
+# Fast training in cifar10
+```bash
+python cifar10-vgg-small.py --qw 4 --qa 4 --logdir_id w4a4 
+```
+
 # LQ-Nets
 
 By [Dongqing Zhang](https://github.com/zdqzeros), [Jiaolong Yang](http://jlyang.org), [Dongqiangzi Ye](https://github.com/EowinYe), [Gang Hua](https://www.microsoft.com/en-us/research/people/ganghua/).

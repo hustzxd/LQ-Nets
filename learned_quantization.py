@@ -159,7 +159,6 @@ def QuantizedWeight(name, x, n, nbit=2):
         thrs_multiplier_i[i - 1] = 0.5
         thrs_multiplier_i[i] = 0.5
         init_thrs_multiplier.append(thrs_multiplier_i)
-
     with tf.variable_scope(name):
         basis = tf.get_variable(
             'basis', bit_dims, tf.float32,
@@ -172,21 +171,22 @@ def QuantizedWeight(name, x, n, nbit=2):
 
         ctx = get_current_tower_context()  # current tower context
         # calculate levels and sort
-        levels = tf.matmul(level_codes, basis)
-        levels, sort_id = tf.nn.top_k(tf.transpose(levels, [1, 0]), num_levels)
-        levels = tf.reverse(levels, [-1])
-        sort_id = tf.reverse(sort_id, [-1])
+        levels = tf.matmul(level_codes, basis)  # (4, 46)
+        levels, sort_id = tf.nn.top_k(tf.transpose(levels, [1, 0]), num_levels)  # transpose for sorted
+        levels = tf.reverse(levels, [-1])  # sorted reverse
+        sort_id = tf.reverse(sort_id, [-1])  # sorted reverse
         levels = tf.transpose(levels, [1, 0])
-        sort_id = tf.transpose(sort_id, [1, 0])
+        sort_id = tf.transpose(sort_id, [1, 0])  # transpose to original shape
         # calculate threshold
         thrs = tf.matmul(thrs_multiplier, levels)
         # calculate level codes per channel
-        reshape_x = tf.reshape(x, [-1, num_filters])
-        level_codes_channelwise_dims = tf.stack([num_levels * num_filters, nbit])
-        level_codes_channelwise = tf.fill(level_codes_channelwise_dims, 0.)
+        reshape_x = tf.reshape(x, [-1, num_filters])  # x=(3, 3, 64, 64) reshape_x=(576, 64)
+        level_codes_channelwise_dims = tf.stack([num_levels * num_filters, nbit])  # [4*64, 2] shape:(2,)
+        level_codes_channelwise = tf.fill(level_codes_channelwise_dims, 0.)  # (256,2)
         for i in range(num_levels):
-            eq = tf.equal(sort_id, i)
-            level_codes_channelwise = tf.where(tf.reshape(eq, [-1]), level_codes_channelwise + level_codes[i], level_codes_channelwise)
+            eq = tf.equal(sort_id, i)  # (4, 64)
+            level_codes_channelwise = tf.where(tf.reshape(eq, [-1]), level_codes_channelwise + level_codes[i],
+                                               level_codes_channelwise)
         level_codes_channelwise = tf.reshape(level_codes_channelwise, [num_levels, num_filters, nbit])
         # calculate output y and its binary code
         y = tf.zeros_like(x) + levels[0]  # output
@@ -196,9 +196,10 @@ def QuantizedWeight(name, x, n, nbit=2):
         zero_bits_y = tf.fill(zero_dims, 0.)
         zero_bits_y = tf.reshape(zero_bits_y, [-1, num_filters, nbit])
         for i in range(num_levels - 1):
-            g = tf.greater(x, thrs[i])
-            y = tf.where(g, zero_y + levels[i + 1], y)
-            bits_y = tf.where(tf.reshape(g, [-1]), tf.reshape(zero_bits_y + level_codes_channelwise[i + 1], [-1, nbit]), bits_y)
+            g = tf.greater(x, thrs[i])  # shape=(3, 3, 64, 64)
+            y = tf.where(g, zero_y + levels[i + 1], y)  # shape=(3, 3, 64, 64)
+            bits_y = tf.where(tf.reshape(g, [-1]), tf.reshape(zero_bits_y + level_codes_channelwise[i + 1], [-1, nbit]),
+                              bits_y)  # shape=(?, 2)
         bits_y = tf.reshape(bits_y, [-1, num_filters, nbit])
         # training
         if ctx.is_main_training_tower:

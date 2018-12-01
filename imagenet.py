@@ -12,6 +12,7 @@ from tensorpack.models import *
 from tensorpack.tfutils import argscope, get_model_loader
 from tensorpack.train import AutoResumeTrainConfig, SyncMultiGPUTrainerReplicated, launch_train_with_config
 from tensorpack.utils.gpu import get_nr_gpu
+import tensorflow as tf
 
 import imagenet_utils
 from alexnet_model import alexnet_backbone
@@ -160,6 +161,9 @@ if __name__ == '__main__':
 
     TOTAL_BATCH_SIZE = args.batch_size
     imagenet_utils.DEFAULT_IMAGE_SHAPE = args.input_size
+
+    gpu_options = tf.GPUOptions(allow_growth=True)
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
 
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu

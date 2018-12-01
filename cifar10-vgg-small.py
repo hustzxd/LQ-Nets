@@ -88,7 +88,8 @@ class Model(ModelDesc):
         self.cost = tf.add_n([cost, wd_cost], name='cost')
 
     def _get_optimizer(self):
-        lr = get_scalar_var('learning_rate', 0.02, summary=True)
+        lr = tf.get_variable('learning_rate', initializer=0.02, trainable=False)
+        # lr = get_scalar_var('learning_rate', 0.02, summary=True)
         opt = tf.train.MomentumOptimizer(lr, 0.9)
         return opt
 
@@ -115,6 +116,12 @@ def get_data(train_or_test):
     return ds
 
 
+def prediction_incorrect(logits, label, topk=1, name='incorrect_vector'):
+    with tf.name_scope('prediction_incorrect'):
+        x = tf.logical_not(tf.nn.in_top_k(logits, label, topk))
+    return tf.cast(x, tf.float32, name=name)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
@@ -127,13 +134,18 @@ if __name__ == '__main__':
     parser.add_argument('--load', help='load model')
     parser.add_argument('--logdir', help='identify of logdir',
                         type=str, default='cifar10-vgg-small')
+    parser.add_argument('--logdir_id', help='identify of logdir', type=str, default='')
+
     args = parser.parse_args()
+
+    gpu_options = tf.GPUOptions(allow_growth=True)
+    sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
 
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     logger.set_logger_dir(
-        os.path.join('train_log', args.logdir))
+        os.path.join('train_log', args.logdir + args.logdir_id))
 
     dataset_train = get_data('train')
     dataset_test = get_data('test')
@@ -152,4 +164,6 @@ if __name__ == '__main__':
         nr_tower=max(get_nr_gpu(), 1),
         session_init=SaverRestore(args.load) if args.load else None
     )
-    SyncMultiGPUTrainerParameterServer(config).train()
+    trainer = SyncMultiGPUTrainerReplicated(max(get_nr_gpu(), 1))
+    launch_train_with_config(config, trainer)
+    # SyncMultiGPUTrainerParameterServer(config).train()
