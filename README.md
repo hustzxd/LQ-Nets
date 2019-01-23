@@ -1,3 +1,5 @@
+# We will submit re-implementation version in MXNet. Please checkout to 'mxnet' branch.
+
 # Fast training in cifar10
 ```bash
 python cifar10-vgg-small.py --qw 4 --qa 4 --logdir_id w4a4 
