@@ -1,4 +1,6 @@
-# We will submit re-implementation version in MXNet. Please checkout to 'mxnet' branch.
+# MxNet version
+
+> We will submit a re-implementation version in MXNet. Please checkout to `mxnet` branch.
 
 # Fast training in cifar10
 ```bash
