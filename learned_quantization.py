@@ -1,381 +1,373 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-# File: learned_quantization.py
-
-import tensorflow as tf
-from tensorflow.contrib.framework import add_model_variable
-from tensorflow.python.training import moving_averages
-from tensorpack.models import *
-from tensorpack.tfutils.tower import get_current_tower_context
+import mxnet as mx
+import mxnet.gluon as mxg
+from mxnet import autograd
+from mxnet.gluon import HybridBlock
+from numpy.linalg import inv
+import torch
 
 MOVING_AVERAGES_FACTOR = 0.9
 EPS = 0.0001
 NORM_PPF_0_75 = 0.6745
 
 
-@layer_register()
-def QuantizedActiv(x, nbit=2):
+class MatrixInverse(mx.operator.CustomOp):
     """
-    Quantize activation.
-    Args:
-        x (tf.Tensor): a 4D tensor.
-        nbit (int): number of bits of quantized activation. Defaults to 2.
-    Returns:
-        tf.Tensor with attribute `variables`.
-    Variable Names:
-    * ``basis``: basis of quantized activation.
-    Note:
-        About multi-GPU training: moving averages across GPUs are not aggregated.
-        Batch statistics are computed by main training tower. This is consistent with most frameworks.
+    Note: Unluckily, I did not find the inverse of the matrix operation in MXNet.
+    In the end, I add custom operation to implement matrix inverse.
+    Reference: https://mxnet.incubator.apache.org/tutorials/gluon/customop.html
     """
-    init_basis = [(NORM_PPF_0_75 * 2 / (2 ** nbit - 1)) * (2. ** i) for i in range(nbit)]
-    init_basis = tf.constant_initializer(init_basis)
-    bit_dims = [nbit, 1]
-    num_levels = 2 ** nbit
-    # initialize level multiplier
-    init_level_multiplier = []
-    for i in range(0, num_levels):
-        level_multiplier_i = [0. for j in range(nbit)]
-        level_number = i
-        for j in range(nbit):
-            level_multiplier_i[j] = float(level_number % 2)
-            level_number = level_number // 2
-        init_level_multiplier.append(level_multiplier_i)
-    # initialize threshold multiplier
-    init_thrs_multiplier = []
-    for i in range(1, num_levels):
-        thrs_multiplier_i = [0. for j in range(num_levels)]
-        thrs_multiplier_i[i - 1] = 0.5
-        thrs_multiplier_i[i] = 0.5
-        init_thrs_multiplier.append(thrs_multiplier_i)
 
-    with tf.variable_scope('ActivationQuantization'):
-        basis = tf.get_variable(
-            'basis', bit_dims, tf.float32,
-            initializer=init_basis,
-            trainable=False)
+    def forward(self, is_train, req, in_data, out_data, aux):
+        """Implements forward computation.
 
-        ctx = get_current_tower_context()  # current tower context
+        is_train : bool, whether forwarding for training or testing.
+        req : list of {'null', 'write', 'inplace', 'add'}, how to assign to out_data. 'null' means skip assignment, etc.
+        in_data : list of NDArray, input data.
+        out_data : list of NDArray, pre-allocated output buffers.
+        aux : list of NDArray, mutable auxiliary states. Usually not used.
+        """
+        x = in_data[0].asnumpy()
+        # TODO: need cuda????? cost much time
+        # TODO: if k == 1, B_inv = 1/B
+        # TODO: if k == 2, B_inv = 1/(ad-bc) * [[d, -b],[-c, a]]
+        if x.shape[0] == 1:
+            try:
+                x_inv = inv(x)
+            except:
+                print('activation: {} is a singular matrix \n try + 1'.format(x))
+                x[0, 0, 0] += 1
+                try:
+                    x_inv = inv(x)
+                except:
+                    print('!!!activation: {} is a singular matrix \n exit now!!'.format(x))
+                    exit()
+            x_inv = mx.nd.array(x_inv)
+        else:
+            torch_x = torch.Tensor(x)
+            torch_y = torch.zeros_like(torch_x)
+            for i in range(torch_x.shape[0]):
+                try:
+                    torch_y[i] = torch_x[i].inverse()
+                except:
+                    print('weights: {} is a singular matrix \n try + 1'.format(torch_y[i]))
+                    torch_x[i, 0, 0] += 1
+                    try:
+                        torch_y[i] = torch_x[i].inverse()
+                    except:
+                        print('!!!weights: {} is a singular matrix \n exit now!!'.format(torch_x[i]))
+                        exit()
+            x_inv = torch_y.numpy()
+            x_inv = mx.nd.array(x_inv)
+        self.assign(out_data[0], req[0], x_inv)
+
+    def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
+        """Implements backward computation
+
+        req : list of {'null', 'write', 'inplace', 'add'}, how to assign to in_grad
+        out_grad : list of NDArray, gradient w.r.t. output data.
+        in_grad : list of NDArray, gradient w.r.t. input data. This is the output buffer.
+        """
+        dy = out_grad[0].asnumpy()
+        # Note: We don't need backward in this projects.
+        self.assign(in_grad[0], req[0], mx.nd.array(dy))
+
+
+@mx.operator.register("matrix_inverse")  # register with name "sigmoid"
+class MatrixInverseProp(mx.operator.CustomOpProp):
+    def __init__(self):
+        super(MatrixInverseProp, self).__init__(True)
+
+    def list_arguments(self):
+        #  this can be omitted if you only have 1 input.
+        return ['data']
+
+    def list_outputs(self):
+        #  this can be omitted if you only have 1 output.
+        return ['output']
+
+    def infer_shape(self, in_shapes):
+        """Calculate output shapes from input shapes. This can be
+        omited if all your inputs and outputs have the same shape.
+
+        in_shapes : list of shape. Shape is described by a tuple of int.
+        """
+        data_shape = in_shapes[0]
+        assert len(data_shape) == 3, 'matrix inverse only support 2-dim matrix with n channel'
+        assert data_shape[1] == data_shape[2], 'matrix inverse only support matrix that has same col and row'
+        output_shape = data_shape
+        # return 3 lists representing inputs shapes, outputs shapes, and aux data shapes.
+        return (data_shape,), (output_shape,), ()
+
+    def create_operator(self, ctx, in_shapes, in_dtypes):
+        #  create and return the CustomOp class.
+        return MatrixInverse()
+
+
+class QuantizedActivation(HybridBlock):
+    def __init__(self, nbits, op_name='ActQ', prefix=None, params=None):
+        super(QuantizedActivation, self).__init__(prefix=prefix, params=params)
+        if nbits <= 0:
+            return
+        self.nbits = nbits
+        init_basis = [[(NORM_PPF_0_75 * 2 / (2 ** self.nbits - 1)) * (2. ** i)] for i in range(self.nbits)]
+        init_basis = mx.init.Constant(init_basis)
+        bit_dims = [self.nbits, 1]
+        self.num_levels = 2 ** self.nbits
+        # initialize level multiplier
+        init_level_multiplier = []
+        for i in range(0, self.num_levels):
+            level_multiplier_i = [0. for j in range(self.nbits)]
+            level_number = i
+            for j in range(self.nbits):
+                level_multiplier_i[j] = float(level_number % 2)
+                level_number = level_number // 2
+            init_level_multiplier.append(level_multiplier_i)
+        init_level_multiplier = mx.init.Constant(init_level_multiplier)
+        # initialize threshold multiplier
+        init_thrs_multiplier = []
+        for i in range(1, self.num_levels):
+            thrs_multiplier_i = [0. for j in range(self.num_levels)]
+            thrs_multiplier_i[i - 1] = 0.5
+            thrs_multiplier_i[i] = 0.5
+            init_thrs_multiplier.append(thrs_multiplier_i)
+        init_thrs_multiplier = mx.init.Constant(init_thrs_multiplier)
+        with self.name_scope():
+            self.basis = self.params.get('basis',
+                                         shape=bit_dims,
+                                         init=init_basis,
+                                         # Convert to regular list to make this object serializable
+                                         allow_deferred_init=False,
+                                         differentiable=False)
+            self.level_codes = self.params.get('level_codes',
+                                               shape=[2 ** nbits, nbits],
+                                               init=init_level_multiplier,
+                                               allow_deferred_init=False,
+                                               differentiable=False)
+            self.thrs_multiplier = self.params.get('thrs_multiplier',
+                                                   shape=[2 ** nbits - 1, 2 ** nbits],
+                                                   init=init_thrs_multiplier,
+                                                   allow_deferred_init=False,
+                                                   differentiable=False)
+
+    def hybrid_forward(self, F, x, basis=None, level_codes=None, thrs_multiplier=None):
+        # print('basis:{}'.format(basis))
+        if basis is None:
+            return x
         # calculate levels and sort
-        level_codes = tf.constant(init_level_multiplier)
-        levels = tf.matmul(level_codes, basis)
-        levels, sort_id = tf.nn.top_k(tf.transpose(levels, [1, 0]), num_levels)
-        levels = tf.reverse(levels, [-1])
-        sort_id = tf.reverse(sort_id, [-1])
-        levels = tf.transpose(levels, [1, 0])
-        sort_id = tf.transpose(sort_id, [1, 0])
-        # calculate threshold
-        thrs_multiplier = tf.constant(init_thrs_multiplier)
-        thrs = tf.matmul(thrs_multiplier, levels)
-        # calculate output y and its binary code
-        y = tf.zeros_like(x)  # output
-        reshape_x = tf.reshape(x, [-1])
-        zero_dims = tf.stack([tf.shape(reshape_x)[0], nbit])
-        bits_y = tf.fill(zero_dims, 0.)
-        zero_y = tf.zeros_like(x)
-        zero_bits_y = tf.fill(zero_dims, 0.)
-        for i in range(num_levels - 1):
-            g = tf.greater(x, thrs[i])
-            y = tf.where(g, zero_y + levels[i + 1], y)
-            bits_y = tf.where(tf.reshape(g, [-1]), zero_bits_y + level_codes[sort_id[i + 1][0]], bits_y)
-        # training
-        if ctx.is_main_training_tower:
-            BT = tf.matrix_transpose(bits_y)
-            # calculate BTxB
-            BTxB = []
-            for i in range(nbit):
-                for j in range(nbit):
-                    BTxBij = tf.multiply(BT[i], BT[j])
-                    BTxBij = tf.reduce_sum(BTxBij)
-                    BTxB.append(BTxBij)
-            BTxB = tf.reshape(tf.stack(values=BTxB), [nbit, nbit])
-            BTxB_inv = tf.matrix_inverse(BTxB)
-            # calculate BTxX
-            BTxX = []
-            for i in range(nbit):
-                BTxXi0 = tf.multiply(BT[i], reshape_x)
-                BTxXi0 = tf.reduce_sum(BTxXi0)
-                BTxX.append(BTxXi0)
-            BTxX = tf.reshape(tf.stack(values=BTxX), [nbit, 1])
-
-            new_basis = tf.matmul(BTxB_inv, BTxX)  # calculate new basis
-            # create moving averages op
-            updata_moving_basis = moving_averages.assign_moving_average(
-                basis, new_basis, MOVING_AVERAGES_FACTOR)
-            add_model_variable(basis)
-            tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, updata_moving_basis)
-
-            for i in range(nbit):
-                tf.summary.scalar('basis%d' % i, new_basis[i][0])
-
-        x_clip = tf.minimum(x, levels[num_levels - 1])  # gradient clip
-        y = x_clip + tf.stop_gradient(-x_clip) + tf.stop_gradient(y)  # gradient: y=clip(x)
-        y.variables = VariableHolder(basis=basis)
+        with autograd.pause():
+            levels = F.dot(level_codes, basis)
+            levels, sort_id = F.topk(F.transpose(levels), ret_typ='both', k=self.num_levels, is_ascend=1)  # ascend
+            levels = F.transpose(levels)
+            # TODO: levels need backward
+            sort_id = F.transpose(sort_id)
+            # calculate threshold
+            thrs = F.dot(thrs_multiplier, levels)
+            # calculate output y and its binary code
+            y = F.zeros_like(x)  # output
+            reshape_x = F.reshape(x, [-1])
+            BT = F.zeros_like(reshape_x)
+            BT = F.reshape(F.repeat(BT, self.nbits), shape=(-1, self.nbits))  # (N, k)
+            zero_y = F.zeros_like(x)
+            zero_bits_y = F.zeros_like(BT)
+            for i in range(self.num_levels - 1):
+                g = F.broadcast_greater(x, thrs[i])  # module 'mxnet.symbol' has no attribute 'greater'
+                y = F.where(g, zero_y + levels[i + 1], y)
+                BT = F.where(F.reshape(g, [-1]), zero_bits_y + level_codes[sort_id[i + 1][0]], BT)
+        if autograd.is_training():
+            with autograd.pause():
+                # calculate BxBT
+                B = F.transpose(BT)
+                BxBT = F.zeros([self.nbits, self.nbits])
+                for i in range(self.nbits):
+                    for j in range(self.nbits):
+                        BxBTij = F.multiply(B[i], B[j])
+                        BxBTij = F.sum(BxBTij)
+                        if i == j:
+                            BxBTij += EPS
+                        BxBT[i, j] = BxBTij
+                BxBT_inv = F.Custom(BxBT.expand_dims(0), op_type='matrix_inverse')
+                BxBT_inv = BxBT_inv[0]
+                # BxBT_inv = BxBT
+                # calculate BxX
+                BxX = F.zeros([self.nbits])
+                for i in range(self.nbits):
+                    BxXi0 = F.multiply(B[i], reshape_x)
+                    BxXi0 = F.sum(BxXi0)
+                    BxX[i] = BxXi0
+                BxX = F.reshape(BxX, [self.nbits, 1])
+                new_basis = F.dot(BxBT_inv, BxX)
+                # create moving averages op
+                basis = MOVING_AVERAGES_FACTOR * basis + new_basis * (1 - MOVING_AVERAGES_FACTOR)
+                self.basis.set_data(basis)
+        x_clip = F.minimum(x, levels[self.num_levels - 1])  # gradient clip
+        y = x_clip + F.stop_gradient(-x_clip) + F.stop_gradient(y)  # gradient: y=clip(x)
         return y
 
 
-def QuantizedWeight(name, x, n, nbit=2):
+class Conv2DQ(mxg.nn.Conv2D):
+    def __init__(self, nbits, channels, kernel_size, strides=(1, 1), padding=(0, 0),
+                 dilation=(1, 1), groups=1, layout='NCHW',
+                 activation=None, use_bias=True, weight_initializer=None,
+                 bias_initializer='zeros', in_channels=0, **kwargs):
+        super(Conv2DQ, self).__init__(channels, kernel_size, strides=strides, padding=padding,
+                                      dilation=dilation, groups=groups, layout=layout,
+                                      activation=activation, use_bias=use_bias, weight_initializer=weight_initializer,
+                                      bias_initializer=bias_initializer, in_channels=in_channels, **kwargs)
+        if nbits <= 0:
+            return
+        self._nbits = nbits
+        self._num_filters = channels
+        base = NORM_PPF_0_75 * ((2. / (channels * kernel_size * kernel_size)) ** 0.5) / (2 ** (nbits - 1))
+        init_basis = []
+        for j in range(nbits):
+            init_basis.append([(2 ** j) * base for i in range(channels)])
+        init_basis = mx.init.Constant(init_basis)
+        # initialize level multiplier
+        self._num_levels = 2 ** nbits
+        init_level_multiplier = []
+        for i in range(self._num_levels):
+            level_multiplier_i = [0. for j in range(nbits)]
+            level_number = i
+            for j in range(nbits):
+                binary_code = level_number % 2
+                if binary_code == 0:
+                    binary_code = -1
+                level_multiplier_i[j] = float(binary_code)
+                level_number = level_number // 2
+            init_level_multiplier.append(level_multiplier_i)
+        init_level_multiplier = mx.init.Constant(init_level_multiplier)
+        # initialize threshold multiplier
+        init_thrs_multiplier = []
+        for i in range(1, self._num_levels):
+            thrs_multiplier_i = [0. for j in range(self._num_levels)]
+            thrs_multiplier_i[i - 1] = 0.5
+            thrs_multiplier_i[i] = 0.5
+            init_thrs_multiplier.append(thrs_multiplier_i)
+        init_thrs_multiplier = mx.init.Constant(init_thrs_multiplier)
+        init_sum_multiplier = mx.nd.ones(shape=(1, kernel_size * kernel_size * in_channels))
+        init_sum_multiplier = mx.init.Constant(init_sum_multiplier)
+        init_sum_multiplier_basis = mx.nd.ones(shape=[1, nbits])
+        init_sum_multiplier_basis = mx.init.Constant(init_sum_multiplier_basis)
+        with self.name_scope():
+            self.basis = self.params.get('basis',
+                                         shape=(nbits, channels),
+                                         init=init_basis,
+                                         allow_deferred_init=False,
+                                         differentiable=False)
+            self.level_code = self.params.get('level_code',
+                                              shape=(self._num_levels, nbits),
+                                              init=init_level_multiplier,
+                                              allow_deferred_init=False,
+                                              differentiable=False)
+            self.thrs_multiplier = self.params.get('thrs_multiplier',
+                                                   shape=(self._num_levels - 1, self._num_levels),
+                                                   init=init_thrs_multiplier,
+                                                   allow_deferred_init=False,
+                                                   differentiable=False)
+            self.sum_multiplier = self.params.get('sum_multiplier',
+                                                  shape=(1, kernel_size * kernel_size * in_channels),
+                                                  init=init_sum_multiplier,
+                                                  allow_deferred_init=False,
+                                                  differentiable=False)
+            self.sum_multiplier_basis = self.params.get('sum_multiplier_basis',
+                                                        shape=(1, nbits),
+                                                        init=init_sum_multiplier_basis,
+                                                        allow_deferred_init=False,
+                                                        differentiable=False)
+
+    def hybrid_forward(self, F, x, weight, bias=None, basis=None, level_code=None, thrs_multiplier=None,
+                       sum_multiplier=None, sum_multiplier_basis=None):
+        if basis is None:
+            return super(Conv2DQ, self).hybrid_forward(F, x, weight=weight, bias=bias)
+        with autograd.pause():
+            tf_w = F.transpose(weight, [2, 3, 1, 0])  # transpose w as [h, w, in_c, out_c]
+            levels = F.dot(level_code, basis)
+            levels, sort_id = F.topk(F.transpose(levels), ret_typ='both', k=self._num_levels, is_ascend=1)  # ascend
+            levels = F.transpose(levels)
+            sort_id = F.transpose(sort_id)
+            # calculate threshold
+            thrs = F.dot(thrs_multiplier, levels)
+
+            level_codes_channelwise = F.zeros(shape=(self._num_levels * self._num_filters, self._nbits))
+            for i in range(self._num_levels):
+                eq = F.equal(sort_id, i)  # (4, 128)
+                # tf.reshape(eq, [-1]) (512, )
+                level_codes_channelwise = F.where(F.reshape(eq, [-1]), level_codes_channelwise + level_code[i],
+                                                  level_codes_channelwise)
+            level_codes_channelwise = F.reshape(level_codes_channelwise,
+                                                [self._num_levels, self._num_filters, self._nbits])
+            reshape_w = F.reshape(tf_w, [-1, self._num_filters])  # (576, 128)
+            w_q = F.zeros_like(tf_w) + levels[0]  # 3x3x64x128
+            w_q_zero = F.zeros_like(tf_w)  # 3x3x64x128
+            zero_dims = [reshape_w.shape[0] * self._num_filters, self._nbits]  # [576 * 128, 2]
+            bits_w_q = F.zeros(zero_dims) + -1  # (576 * 128, 2)
+            zero_bits_w_q = F.reshape(F.zeros(zero_dims), [-1, self._num_filters, self._nbits])  # (576, 128, 2)
+            for i in range(self._num_levels - 1):
+                g = F.greater(tf_w, thrs[i])
+                w_q = F.where(g, w_q_zero + levels[i + 1], w_q)
+                bits_w_q = F.where(F.reshape(g, [-1]),
+                                   # zero_bits_w_q + level_codes_channelwise[i + 1] (576,128,2)
+                                   F.reshape(zero_bits_w_q + level_codes_channelwise[i + 1], [-1, self._nbits]),
+                                   bits_w_q)
+            bits_w_q = F.reshape(bits_w_q, [-1, self._num_filters, self._nbits])  # (576, 128, 2)
+        if autograd.is_training():
+            with autograd.pause():
+                # sum_multiplier = F.ones([1, F.reshape(tf_w, [-1, self._num_filters]).shape[0]])
+                # sum_multiplier_basis = F.ones([1, self._nbits])
+                BT = F.transpose(bits_w_q, [2, 0, 1])
+                # calculate BTxB
+                BTxB = F.zeros([self._nbits, self._nbits, self._num_filters])
+                for i in range(self._nbits):
+                    for j in range(self._nbits):
+                        # TODO: BTxBij == BTxBji, so it can speed up
+                        BTxBij = F.multiply(BT[i], BT[j])
+                        BTxBij = F.dot(sum_multiplier, BTxBij)
+                        if i == j:
+                            mat_one = F.ones([1, self._num_filters])
+                            BTxBij = BTxBij + (EPS * mat_one)  # + E
+                        BTxB[i, j, :] = F.reshape(BTxBij, [-1])
+                # calculate inverse of BTxB
+                BTxB_inv = F.zeros([self._nbits, self._nbits, self._num_filters])
+                if self._nbits > 2:
+                    BTxB_transpose = F.transpose(BTxB, [2, 0, 1])
+                    BTxB_inv = F.Custom(BTxB_transpose, op_type='matrix_inverse')
+                    BTxB_inv = F.transpose(BTxB_inv, [1, 2, 0])
+                elif self._nbits == 2:
+                    det = F.multiply(BTxB[0][0], BTxB[1][1]) - F.multiply(BTxB[0][1], BTxB[1][0])
+                    BTxB_inv[0, 0] = BTxB[1][1] / det
+                    BTxB_inv[0, 1] = -BTxB[0][1] / det
+                    BTxB_inv[1, 0] = -BTxB[1][0] / det
+                    BTxB_inv[1, 1] = BTxB[0][0] / det
+                elif self._nbits == 1:
+                    BTxB_inv = 1 / BTxB
+                # calculate BTxX
+                BTxX = F.zeros([self._nbits, self._num_filters])
+                for i in range(self._nbits):
+                    BTxXi0 = F.multiply(BT[i], reshape_w)  # (576, 128)
+                    BTxXi0 = F.dot(sum_multiplier, BTxXi0)
+                    BTxX[i] = BTxXi0
+                new_basis = F.zeros([self._nbits, self._num_filters])
+
+                for i in range(self._nbits):
+                    new_basis_i = F.multiply(BTxB_inv[i], BTxX)
+                    new_basis_i = F.dot(sum_multiplier_basis, new_basis_i)
+                    new_basis[i] = new_basis_i
+                # create moving averages op
+                basis = MOVING_AVERAGES_FACTOR * basis + new_basis * (1 - MOVING_AVERAGES_FACTOR)
+                self.basis.set_data(basis)
+        weight_q = F.transpose(w_q, [3, 2, 0, 1])
+        weight_q = weight + F.stop_gradient(-weight) + F.stop_gradient(weight_q)  # gradient: y=x
+        return super(Conv2DQ, self).hybrid_forward(F, x, weight=weight_q, bias=bias)
+
+
+def print_params(title, net):
     """
-    Quantize weight.
-    Args:
-        x (tf.Tensor): a 4D tensor.
-            Must have known number of channels, but can have other unknown dimensions.
-        name (str): operator's name.
-        n (int or double): variance of weight initialization.
-        nbit (int): number of bits of quantized weight. Defaults to 2.
-    Returns:
-        tf.Tensor with attribute `variables`.
-    Variable Names:
-    * ``basis``: basis of quantized weight.
-    Note:
-        About multi-GPU training: moving averages across GPUs are not aggregated.
-        Batch statistics are computed by main training tower. This is consistent with most frameworks.
+    Helper function to print out the state of parameters.
     """
-    num_filters = x.get_shape().as_list()[-1]
-    init_basis = []
-    base = NORM_PPF_0_75 * ((2. / n) ** 0.5) / (2 ** (nbit - 1))
-    for j in range(nbit):
-        init_basis.append([(2 ** j) * base for i in range(num_filters)])
-    init_basis = tf.constant_initializer(init_basis)
-    bit_dims = [nbit, num_filters]
-    num_levels = 2 ** nbit
-    delta = EPS
-    # initialize level multiplier
-    init_level_multiplier = []
-    for i in range(num_levels):
-        level_multiplier_i = [0. for j in range(nbit)]
-        level_number = i
-        for j in range(nbit):
-            binary_code = level_number % 2
-            if binary_code == 0:
-                binary_code = -1
-            level_multiplier_i[j] = float(binary_code)
-            level_number = level_number // 2
-        init_level_multiplier.append(level_multiplier_i)
-    # initialize threshold multiplier
-    init_thrs_multiplier = []
-    for i in range(1, num_levels):
-        thrs_multiplier_i = [0. for j in range(num_levels)]
-        thrs_multiplier_i[i - 1] = 0.5
-        thrs_multiplier_i[i] = 0.5
-        init_thrs_multiplier.append(thrs_multiplier_i)
-    with tf.variable_scope(name):
-        basis = tf.get_variable(
-            'basis', bit_dims, tf.float32,
-            initializer=init_basis,
-            trainable=False)
-        level_codes = tf.constant(init_level_multiplier)
-        thrs_multiplier = tf.constant(init_thrs_multiplier)
-        sum_multiplier = tf.constant(1., shape=[1, tf.reshape(x, [-1, num_filters]).get_shape()[0]])
-        sum_multiplier_basis = tf.constant(1., shape=[1, nbit])
-
-        ctx = get_current_tower_context()  # current tower context
-        # calculate levels and sort
-        levels = tf.matmul(level_codes, basis)  # (4, 46)
-        levels, sort_id = tf.nn.top_k(tf.transpose(levels, [1, 0]), num_levels)  # transpose for sorted
-        levels = tf.reverse(levels, [-1])  # sorted reverse
-        sort_id = tf.reverse(sort_id, [-1])  # sorted reverse
-        levels = tf.transpose(levels, [1, 0])
-        sort_id = tf.transpose(sort_id, [1, 0])  # transpose to original shape
-        # calculate threshold
-        thrs = tf.matmul(thrs_multiplier, levels)
-        # calculate level codes per channel
-        reshape_x = tf.reshape(x, [-1, num_filters])  # x=(3, 3, 64, 64) reshape_x=(576, 64)
-        level_codes_channelwise_dims = tf.stack([num_levels * num_filters, nbit])  # [4*64, 2] shape:(2,)
-        level_codes_channelwise = tf.fill(level_codes_channelwise_dims, 0.)  # (256,2)
-        for i in range(num_levels):
-            eq = tf.equal(sort_id, i)  # (4, 64)
-            level_codes_channelwise = tf.where(tf.reshape(eq, [-1]), level_codes_channelwise + level_codes[i],
-                                               level_codes_channelwise)
-        level_codes_channelwise = tf.reshape(level_codes_channelwise, [num_levels, num_filters, nbit])
-        # calculate output y and its binary code
-        y = tf.zeros_like(x) + levels[0]  # output
-        zero_dims = tf.stack([tf.shape(reshape_x)[0] * num_filters, nbit])
-        bits_y = tf.fill(zero_dims, -1.)
-        zero_y = tf.zeros_like(x)
-        zero_bits_y = tf.fill(zero_dims, 0.)
-        zero_bits_y = tf.reshape(zero_bits_y, [-1, num_filters, nbit])
-        for i in range(num_levels - 1):
-            g = tf.greater(x, thrs[i])  # shape=(3, 3, 64, 64)
-            y = tf.where(g, zero_y + levels[i + 1], y)  # shape=(3, 3, 64, 64)
-            bits_y = tf.where(tf.reshape(g, [-1]), tf.reshape(zero_bits_y + level_codes_channelwise[i + 1], [-1, nbit]),
-                              bits_y)  # shape=(?, 2)
-        bits_y = tf.reshape(bits_y, [-1, num_filters, nbit])
-        # training
-        if ctx.is_main_training_tower:
-            BT = tf.transpose(bits_y, [2, 0, 1])
-            # calculate BTxB
-            BTxB = []
-            for i in range(nbit):
-                for j in range(nbit):
-                    BTxBij = tf.multiply(BT[i], BT[j])
-                    BTxBij = tf.matmul(sum_multiplier, BTxBij)
-                    if i == j:
-                        mat_one = tf.ones([1, num_filters])
-                        BTxBij = BTxBij + (delta * mat_one)  # + E
-                    BTxB.append(BTxBij)
-            BTxB = tf.reshape(tf.stack(values=BTxB), [nbit, nbit, num_filters])
-            # calculate inverse of BTxB
-            if nbit > 2:
-                BTxB_transpose = tf.transpose(BTxB, [2, 0, 1])
-                BTxB_inv = tf.matrix_inverse(BTxB_transpose)
-                BTxB_inv = tf.transpose(BTxB_inv, [1, 2, 0])
-            elif nbit == 2:
-                det = tf.multiply(BTxB[0][0], BTxB[1][1]) - tf.multiply(BTxB[0][1], BTxB[1][0])
-                inv = []
-                inv.append(BTxB[1][1] / det)
-                inv.append(-BTxB[0][1] / det)
-                inv.append(-BTxB[1][0] / det)
-                inv.append(BTxB[0][0] / det)
-                BTxB_inv = tf.reshape(tf.stack(values=inv), [nbit, nbit, num_filters])
-            elif nbit == 1:
-                BTxB_inv = tf.reciprocal(BTxB)
-            # calculate BTxX
-            BTxX = []
-            for i in range(nbit):
-                BTxXi0 = tf.multiply(BT[i], reshape_x)
-                BTxXi0 = tf.matmul(sum_multiplier, BTxXi0)
-                BTxX.append(BTxXi0)
-            BTxX = tf.reshape(tf.stack(values=BTxX), [nbit, num_filters])
-            BTxX = BTxX + (delta * basis)  # + basis
-            # calculate new basis
-            new_basis = []
-            for i in range(nbit):
-                new_basis_i = tf.multiply(BTxB_inv[i], BTxX)
-                new_basis_i = tf.matmul(sum_multiplier_basis, new_basis_i)
-                new_basis.append(new_basis_i)
-            new_basis = tf.reshape(tf.stack(values=new_basis), [nbit, num_filters])
-            # create moving averages op
-            updata_moving_basis = moving_averages.assign_moving_average(
-                basis, new_basis, MOVING_AVERAGES_FACTOR)
-            add_model_variable(basis)
-            tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, updata_moving_basis)
-
-        y = x + tf.stop_gradient(-x) + tf.stop_gradient(y)  # gradient: y=x
-        y.variables = VariableHolder(basis=basis)
-        return y
-
-
-@layer_register()
-def Conv2DQuant(x, out_channel, kernel_shape,
-                padding='SAME', stride=1,
-                W_init=None, b_init=None,
-                nl=tf.identity, split=1, use_bias=True,
-                data_format='NHWC', is_quant=True, nbit=1, fc=False):
-    """
-    2D convolution on 4D inputs.
-    Args:
-        x (tf.Tensor): a 4D tensor.
-            Must have known number of channels, but can have other unknown dimensions.
-        out_channel (int): number of output channel.
-        kernel_shape: (h, w) tuple or a int.
-        stride: (h, w) tuple or a int.
-        padding (str): 'valid' or 'same'. Case insensitive.
-        split (int): Split channels as used in Alexnet. Defaults to 1 (no split).
-        W_init: initializer for W. Defaults to `variance_scaling_initializer`.
-        b_init: initializer for b. Defaults to zero.
-        nl: a nonlinearity function.
-        use_bias (bool): whether to use bias.
-        data_format (str): 'NHWC' or 'NCHW'. Defaults to 'NHWC'.
-        is_quant (bool): whether to quantize weight. Defaults to 'True'.
-        nbit (int): number of bits of quantized weight. Defaults to 1.
-        fc (bool): whether to convert Conv2D to FullyConnect. Defaults to 'False'.
-    Returns:
-        tf.Tensor named ``output`` with attribute `variables`.
-    Variable Names:
-    * ``W``: weights
-    * ``b``: bias
-    """
-    n = kernel_shape * kernel_shape * out_channel
-    in_shape = x.get_shape().as_list()
-    channel_axis = 3 if data_format == 'NHWC' else 1
-    in_channel = in_shape[channel_axis]
-    assert in_channel is not None, "[Conv2DQuant] Input cannot have unknown channel!"
-    assert in_channel % split == 0
-    assert out_channel % split == 0
-
-    if fc:
-        x = tf.reshape(x, [-1, in_channel, 1, 1])
-
-    kernel_shape = [kernel_shape, kernel_shape]
-    padding = padding.upper()
-    filter_shape = kernel_shape + [in_channel / split, out_channel]
-
-    if data_format == 'NCHW':
-        stride = [1, 1, stride, stride]
-    else:
-        stride = [1, stride, stride, 1]
-
-    if W_init is None:
-        W_init = tf.contrib.layers.variance_scaling_initializer()
-    if b_init is None:
-        b_init = tf.constant_initializer()
-
-    W = tf.get_variable('W', filter_shape, initializer=W_init)
-
-    kernel_in = W * 1
-    tf.summary.scalar('weight', tf.reduce_mean(tf.abs(W)))
-    if is_quant:
-        quantized_weight = QuantizedWeight('weight_quant', kernel_in, n, nbit=nbit)
-    else:
-        quantized_weight = kernel_in
-
-    if use_bias:
-        b = tf.get_variable('b', [out_channel], initializer=b_init)
-
-    if split == 1:
-        conv = tf.nn.conv2d(x, quantized_weight, stride, padding, data_format=data_format)
-    else:
-        inputs = tf.split(x, split, channel_axis)
-        kernels = tf.split(quantized_weight, split, 3)
-        outputs = [tf.nn.conv2d(i, k, stride, padding, data_format=data_format)
-                   for i, k in zip(inputs, kernels)]
-        conv = tf.concat(outputs, channel_axis)
-
-    ret = nl(tf.nn.bias_add(conv, b, data_format=data_format) if use_bias else conv, name='output')
-    ret.variables = VariableHolder(W=W)
-    if use_bias:
-        ret.variables.b = b
-    if fc:
-        ret = tf.reshape(ret, [-1, out_channel])
-    return ret
-
-
-@layer_register(log_shape=False, use_scope=None)
-def BNReLUQuant(x):
-    """
-    A shorthand of BatchNormalization + ReLU + QuantizedActiv.
-    """
-    x = BatchNorm('bn', x)
-    x = tf.nn.relu(x)
-    x = QuantizedActiv('quant', x)
-    return x
-
-
-def getBNReLUQuant(x, name=None):
-    """
-    A shorthand of BatchNormalization + ReLU + QuantizedActiv.
-    """
-    x = BatchNorm('bn', x)
-    x = tf.nn.relu(x, name=name)
-    x = QuantizedActiv('quant', x)
-    return x
-
-
-def getfcBNReLUQuant(x, name=None):
-    """
-    A shorthand of BatchNormalization + ReLU + QuantizedActiv after FullyConnect.
-    """
-    x = BatchNorm('bn', x, data_format='NHWC', use_scale=False, use_bias=False)
-    x = tf.nn.relu(x, name=name)
-    x = QuantizedActiv('quant', x)
-    return x
-
-
-def getfcBNReLU(x, name=None):
-    """
-    A shorthand of BatchNormalization + ReLU after FullyConnect.
-    """
-    x = BatchNorm('bn', x, data_format='NHWC', use_scale=False, use_bias=False)
-    x = tf.nn.relu(x, name=name)
-    return x
+    print(title)
+    for key, value in net.collect_params().items():
+        data = value.data().reshape(-1)
+        if len(data) > 100:
+            print('{} = {} shape:{}\n'.format(key, data[0:100], value.data().shape))
+        else:
+            print('{} = {}\n'.format(key, value.data()))

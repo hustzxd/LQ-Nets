@@ -1,0 +1,5 @@
+gluoncv
+PIL
+numpy
+torch
+mxnet-cu92
