@@ -1,6 +1,15 @@
 # LQ-MXNet
 
-## Cifar10 Experiments(Still need a lot of effort to train better models)
+This is a very coarse re-implementation in MXNet, and it needs better improvement.  
+- [ ] Training is very slow.
+- [ ] Only test on cifar10.
+- [ ] Doesn't support `hybridize`.
+
+If you are interested in this project, don't hesitate to discuss it with me or pull request.
+
+Thank You!
+
+## Cifar10 Experiments
 | Model(cifar10) | Bit-width(W/A) | Top-1(%) in MXNet | Top-1(%) in Paper |                 scripts                      |
 |----------------|----------------|-------------------|-------------------|----------------------------------------------|
 | VGG-Small      | 32/32          | 93.55             | 93.8              | [baseline](scripts/train_vggsmall_cifar10_baseline.sh)|
