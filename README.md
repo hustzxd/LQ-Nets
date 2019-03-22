@@ -5,7 +5,7 @@ This is a very coarse re-implementation in MXNet, and it needs better improvemen
 - [ ] Only test on cifar10.
 - [ ] Doesn't support `hybridize`.
 
-If you are interested in this project, don't hesitate to discuss it with me or pull request.
+If you are interested in this project, don't hesitate to discuss it with me or **pull request**. :)
 
 Thank You!
 
